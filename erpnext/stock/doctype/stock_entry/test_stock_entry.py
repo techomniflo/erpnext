@@ -15,7 +15,10 @@ from erpnext.stock.doctype.item.test_item import (
 	set_item_variant_settings,
 )
 from erpnext.stock.doctype.serial_no.serial_no import *  # noqa
-from erpnext.stock.doctype.stock_entry.stock_entry import move_sample_to_retention_warehouse
+from erpnext.stock.doctype.stock_entry.stock_entry import (
+	FinishedGoodError,
+	move_sample_to_retention_warehouse,
+)
 from erpnext.stock.doctype.stock_entry.stock_entry_utils import make_stock_entry
 from erpnext.stock.doctype.stock_ledger_entry.stock_ledger_entry import StockFreezeError
 from erpnext.stock.doctype.stock_reconciliation.stock_reconciliation import (
@@ -41,6 +44,7 @@ def get_sle(**args):
 
 class TestStockEntry(ERPNextTestCase):
 	def tearDown(self):
+		frappe.db.rollback()
 		frappe.set_user("Administrator")
 		frappe.db.set_value("Manufacturing Settings", None, "material_consumption", "0")
 
@@ -223,9 +227,47 @@ class TestStockEntry(ERPNextTestCase):
 
 		mtn.cancel()
 
-	def test_repack_no_change_in_valuation(self):
-		company = frappe.db.get_value('Warehouse', '_Test Warehouse - _TC', 'company')
+	def test_repack_multiple_fg(self):
+		"Test `is_finished_item` for one item repacked into two items."
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=100, basic_rate=100)
 
+		repack = frappe.copy_doc(test_records[3])
+		repack.posting_date = nowdate()
+		repack.posting_time = nowtime()
+
+		repack.items[0].qty = 100.0
+		repack.items[0].transfer_qty = 100.0
+		repack.items[1].qty = 50.0
+
+		repack.append("items", {
+			"conversion_factor": 1.0,
+			"cost_center": "_Test Cost Center - _TC",
+			"doctype": "Stock Entry Detail",
+			"expense_account": "Stock Adjustment - _TC",
+			"basic_rate": 150,
+			"item_code": "_Test Item 2",
+			"parentfield": "items",
+			"qty": 50.0,
+			"stock_uom": "_Test UOM",
+			"t_warehouse": "_Test Warehouse - _TC",
+			"transfer_qty": 50.0,
+			"uom": "_Test UOM"
+		})
+		repack.set_stock_entry_type()
+		repack.insert()
+
+		self.assertEqual(repack.items[1].is_finished_item, 1)
+		self.assertEqual(repack.items[2].is_finished_item, 1)
+
+		repack.items[1].is_finished_item = 0
+		repack.items[2].is_finished_item = 0
+
+		# must raise error if 0 fg in repack entry
+		self.assertRaises(FinishedGoodError, repack.validate_finished_goods)
+
+		repack.delete() # teardown
+
+	def test_repack_no_change_in_valuation(self):
 		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=50, basic_rate=100)
 		make_stock_entry(item_code="_Test Item Home Desktop 100", target="_Test Warehouse - _TC",
 			qty=50, basic_rate=100)
@@ -524,6 +566,7 @@ class TestStockEntry(ERPNextTestCase):
 		st1.set_stock_entry_type()
 		st1.insert()
 		st1.submit()
+		st1.cancel()
 
 		frappe.set_user("Administrator")
 		remove_user_permission("Warehouse", "_Test Warehouse 1 - _TC", "test@example.com")
@@ -647,6 +690,8 @@ class TestStockEntry(ERPNextTestCase):
 	def test_variant_work_order(self):
 		bom_no = frappe.db.get_value("BOM", {"item": "_Test Variant Item",
 			"is_default": 1, "docstatus": 1})
+
+		make_item_variant() # make variant of _Test Variant Item if absent
 
 		work_order = frappe.new_doc("Work Order")
 		work_order.update({
@@ -810,6 +855,34 @@ class TestStockEntry(ERPNextTestCase):
 		self.assertEqual(se.get("items")[0].allow_zero_valuation_rate, 1)
 		self.assertEqual(se.get("items")[0].amount, 0)
 
+	def test_zero_incoming_rate(self):
+		""" Make sure incoming rate of 0 is allowed while consuming.
+
+			qty  | rate | valuation rate
+			 1   | 100  | 100
+			 1   | 0    | 50
+			-1   | 100  | 0
+			-1   | 0  <--- assert this
+		"""
+		item_code = "_TestZeroVal"
+		warehouse = "_Test Warehouse - _TC"
+		create_item('_TestZeroVal')
+		_receipt = make_stock_entry(item_code=item_code, qty=1, to_warehouse=warehouse, rate=100)
+		receipt2 = make_stock_entry(item_code=item_code, qty=1, to_warehouse=warehouse, rate=0, do_not_save=True)
+		receipt2.items[0].allow_zero_valuation_rate = 1
+		receipt2.save()
+		receipt2.submit()
+
+		issue = make_stock_entry(item_code=item_code, qty=1, from_warehouse=warehouse)
+
+		value_diff = frappe.db.get_value("Stock Ledger Entry", {"voucher_no": issue.name, "voucher_type": "Stock Entry"}, "stock_value_difference")
+		self.assertEqual(value_diff, -100)
+
+		issue2 = make_stock_entry(item_code=item_code, qty=1, from_warehouse=warehouse)
+		value_diff = frappe.db.get_value("Stock Ledger Entry", {"voucher_no": issue2.name, "voucher_type": "Stock Entry"}, "stock_value_difference")
+		self.assertEqual(value_diff, 0)
+
+
 	def test_gle_for_opening_stock_entry(self):
 		mr = make_stock_entry(item_code="_Test Item", target="Stores - TCP1",
 			company="_Test Company with perpetual inventory", qty=50, basic_rate=100,
@@ -929,6 +1002,35 @@ class TestStockEntry(ERPNextTestCase):
 		distributed_costs = [d.additional_cost for d in se.items]
 		self.assertEqual([40.0, 60.0], distributed_costs)
 
+	def test_independent_manufacture_entry(self):
+		"Test FG items and incoming rate calculation in Maniufacture Entry without WO or BOM linked."
+		se = frappe.get_doc(
+			doctype="Stock Entry",
+			purpose="Manufacture",
+			stock_entry_type="Manufacture",
+			company="_Test Company",
+			items=[
+				frappe._dict(item_code="_Test Item", qty=1, basic_rate=200, s_warehouse="_Test Warehouse - _TC"),
+				frappe._dict(item_code="_Test FG Item", qty=4, t_warehouse="_Test Warehouse 1 - _TC")
+			]
+		)
+		# SE must have atleast one FG
+		self.assertRaises(FinishedGoodError, se.save)
+
+		se.items[0].is_finished_item = 1
+		se.items[1].is_finished_item = 1
+		# SE cannot have multiple FGs
+		self.assertRaises(FinishedGoodError, se.save)
+
+		se.items[0].is_finished_item = 0
+		se.save()
+
+		# Check if FG cost is calculated based on RM total cost
+		# RM total cost = 200, FG rate = 200/4(FG qty) =  50
+		self.assertEqual(se.items[1].basic_rate, flt(se.items[0].basic_rate/4))
+		self.assertEqual(se.value_difference, 0.0)
+		self.assertEqual(se.total_incoming_value, se.total_outgoing_value)
+
 	@change_settings("Stock Settings", {"allow_negative_stock": 0})
 	def test_future_negative_sle(self):
 		# Initialize item, batch, warehouse, opening qty
@@ -1005,6 +1107,52 @@ class TestStockEntry(ERPNextTestCase):
 				batch_no=batch_nos[1],
 				posting_date='2021-09-02', # backdated consumption of 2nd batch
 				purpose='Material Issue')
+
+	def test_multi_batch_value_diff(self):
+		""" Test value difference on stock entry in case of multi-batch.
+			| Stock entry | batch | qty | rate | value diff on SE             |
+			| ---         | ---   | --- | ---  | ---                          |
+			| receipt     | A     | 1   | 10   | 30                           |
+			| receipt     | B     | 1   | 20   |                              |
+			| issue       | A     | -1  | 10   | -30 (to assert after submit) |
+			| issue       | B     | -1  | 20   |                              |
+		"""
+		from erpnext.stock.doctype.batch.test_batch import TestBatch
+
+		batch_nos = []
+
+		item_code = '_TestMultibatchFifo'
+		TestBatch.make_batch_item(item_code)
+		warehouse = '_Test Warehouse - _TC'
+		receipt = make_stock_entry(
+				item_code=item_code,
+				qty=1,
+				rate=10,
+				to_warehouse=warehouse,
+				purpose='Material Receipt',
+				do_not_save=True
+			)
+		receipt.append("items", frappe.copy_doc(receipt.items[0], ignore_no_copy=False).update({"basic_rate": 20}) )
+		receipt.save()
+		receipt.submit()
+		batch_nos.extend(row.batch_no for row in receipt.items)
+		self.assertEqual(receipt.value_difference, 30)
+
+		issue = make_stock_entry(
+				item_code=item_code,
+				qty=1,
+				from_warehouse=warehouse,
+				purpose='Material Issue',
+				do_not_save=True
+			)
+		issue.append("items", frappe.copy_doc(issue.items[0], ignore_no_copy=False))
+		for row, batch_no in zip(issue.items, batch_nos):
+			row.batch_no = batch_no
+		issue.save()
+		issue.submit()
+
+		issue.reload()  # reload because reposting current voucher updates rate
+		self.assertEqual(issue.value_difference, -30)
 
 def make_serialized_item(**args):
 	args = frappe._dict(args)

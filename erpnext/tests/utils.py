@@ -66,6 +66,20 @@ def create_test_contact_and_address():
 	contact.add_phone("+91 0000000000", is_primary_phone=True)
 	contact.insert()
 
+	contact_two = frappe.get_doc({
+		"doctype": 'Contact',
+		"first_name": "_Test Contact 2 for _Test Customer",
+		"links": [
+			{
+				"link_doctype": "Customer",
+				"link_name": "_Test Customer"
+			}
+		]
+	})
+	contact_two.add_email("test_contact_two_customer@example.com", is_primary=True)
+	contact_two.add_phone("+92 0000000000", is_primary_phone=True)
+	contact_two.insert()
+
 
 @contextmanager
 def change_settings(doctype, settings_dict):
@@ -92,6 +106,8 @@ def change_settings(doctype, settings_dict):
 		for key, value in settings_dict.items():
 			setattr(settings, key, value)
 		settings.save()
+		# singles are cached by default, clear to avoid flake
+		frappe.db.value_cache[settings] = {}
 		yield # yield control to calling function
 
 	finally:
@@ -125,17 +141,23 @@ def execute_script_report(
 	if default_filters is None:
 		default_filters = {}
 
+	test_filters = []
 	report_execute_fn = frappe.get_attr(get_report_module_dotted_path(module, report_name) + ".execute")
 	report_filters = frappe._dict(default_filters).copy().update(filters)
 
-	report_data = report_execute_fn(report_filters)
+	test_filters.append(report_filters)
 
 	if optional_filters:
 		for key, value in optional_filters.items():
-			filter_with_optional_param = report_filters.copy().update({key: value})
-			report_execute_fn(filter_with_optional_param)
+			test_filters.append(report_filters.copy().update({key: value}))
 
-	return report_data
+	for test_filter in test_filters:
+		try:
+			report_execute_fn(test_filter)
+		except Exception:
+			print(f"Report failed to execute with filters: {test_filter}")
+			raise
+
 
 
 def timeout(seconds=30, error_message="Test timed out."):
