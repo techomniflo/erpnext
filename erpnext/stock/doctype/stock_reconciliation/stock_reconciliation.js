@@ -148,7 +148,7 @@ frappe.ui.form.on("Stock Reconciliation", {
 					batch_no: d.batch_no
 				},
 				callback: function(r) {
-					frappe.model.set_value(cdt, cdn, "qty", r.message.qty);
+					//frappe.model.set_value(cdt, cdn, "qty", r.message.qty);
 					frappe.model.set_value(cdt, cdn, "valuation_rate", r.message.rate);
 					frappe.model.set_value(cdt, cdn, "current_qty", r.message.qty);
 					frappe.model.set_value(cdt, cdn, "current_valuation_rate", r.message.rate);
