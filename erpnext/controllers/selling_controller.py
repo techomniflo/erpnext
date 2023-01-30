@@ -25,8 +25,8 @@ class SellingController(StockController):
 	def onload(self):
 		super(SellingController, self).onload()
 		if self.doctype in ("Sales Order", "Delivery Note", "Sales Invoice"):
-			for item in self.get("items"):
-				item.update(get_bin_details(item.item_code, item.warehouse))
+			for item in self.get("items") + (self.get("packed_items") or []):
+				item.update(get_bin_details(item.item_code, item.warehouse, include_child_warehouses=True))
 
 	def validate(self):
 		super(SellingController, self).validate()
@@ -578,6 +578,7 @@ class SellingController(StockController):
 			"customer_address": "address_display",
 			"shipping_address_name": "shipping_address",
 			"company_address": "company_address_display",
+			"dispatch_address_name": "dispatch_address",
 		}
 
 		for address_field, address_display_field in address_dict.items():
