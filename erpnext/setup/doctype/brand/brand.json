@@ -9,6 +9,7 @@
  "engine": "InnoDB",
  "field_order": [
   "brand",
+  "customer",
   "image",
   "description",
   "defaults",
@@ -50,13 +51,19 @@
    "fieldtype": "Attach Image",
    "hidden": 1,
    "label": "Image"
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer"
   }
  ],
  "icon": "fa fa-certificate",
  "idx": 1,
  "image_field": "image",
  "links": [],
- "modified": "2021-03-01 15:57:30.005783",
+ "modified": "2023-02-15 12:55:09.465135",
  "modified_by": "Administrator",
  "module": "Setup",
  "name": "Brand",
